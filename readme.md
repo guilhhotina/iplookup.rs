@@ -23,4 +23,4 @@ built with vanilla html, css, and rust. no dependencies
 
 ## demo
 
-[view live demo]()
+[view live demo](https://lazy.fly.dev/)
