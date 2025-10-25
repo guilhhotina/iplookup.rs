@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>IP_LOOKUP</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: #0a0a0a;
+                color: #e0e0e0;
+                font-family: "Courier New", monospace;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+                flex-direction: column;
+            }
+            #terminal {
+                border: 2px solid #fff;
+                padding: 3rem;
+                background: #000;
+                width: 500px;
+                box-shadow: 0 4px 20px rgba(255, 255, 255, 0.1);
+            }
+            h1 {
+                font-size: 1.8rem;
+                letter-spacing: 3px;
+                margin-bottom: 2rem;
+                text-align: center;
+                border-bottom: 1px solid #444;
+                padding-bottom: 1rem;
+            }
+            #output {
+                font-size: 1.3rem;
+                min-height: 60px;
+                margin: 2rem 0;
+                padding: 1rem;
+                background: #111;
+                border-left: 3px solid #fff;
+                opacity: 0;
+                transition: opacity 0.3s;
+            }
+            #output.show {
+                opacity: 1;
+            }
+            button {
+                background: #fff;
+                color: #000;
+                border: 2px solid #fff;
+                padding: 12px 30px;
+                font-family: "Courier New", monospace;
+                font-weight: bold;
+                cursor: pointer;
+                font-size: 1rem;
+                width: 100%;
+                transition: all 0.2s;
+                letter-spacing: 2px;
+            }
+            button:hover {
+                background: #000;
+                color: #fff;
+            }
+            button:active {
+                transform: scale(0.98);
+            }
+            .cursor {
+                animation: blink 1s infinite;
+            }
+            @keyframes blink {
+                0%,
+                49% {
+                    opacity: 1;
+                }
+                50%,
+                100% {
+                    opacity: 0;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div id="terminal">
+            <h1>IP_TERMINAL</h1>
+            <button
+                onclick="fetch('/ip').then(r=>r.text()).then(ip=>{let o=document.getElementById('output');o.innerHTML='> '+ip+'<span class=cursor>_</span>';o.className='show'})"
+            >
+                RETRIEVE IP ADDRESS
+            </button>
+            <div id="output"></div>
+        </div>
+    </body>
+</html>
