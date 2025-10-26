@@ -42,12 +42,11 @@
                 padding: 1.5rem;
                 background: #111;
                 border-left: 3px solid #fff;
-                opacity: 0;
-                transition: opacity 0.3s;
                 line-height: 1.8;
             }
-            #output.show {
-                opacity: 1;
+            /* por padrão, ele não mostra nada */
+            #output:empty {
+                display: none;
             }
             .info-line {
                 margin: 0.5rem 0;
@@ -85,38 +84,24 @@
                 animation: blink 1s infinite;
             }
             @keyframes blink {
-                0%, 49% { opacity: 1; }
-                50%, 100% { opacity: 0; }
+                0%,
+                49% {
+                    opacity: 1;
+                }
+                50%,
+                100% {
+                    opacity: 0;
+                }
             }
         </style>
     </head>
     <body>
         <div id="terminal">
             <h1>IP_TERMINAL</h1>
-            <button onclick="fetchInfo()">RETRIEVE IP INFO</button>
-            <div id="output"></div>
+            <form action="/" method="post">
+                <button type="submit">RETRIEVE IP INFO</button>
+            </form>
+            <div id="output">{ip_info_placeholder}</div>
         </div>
-        <script>
-            function fetchInfo() {
-                fetch('/ip')
-                    .then(r => r.json())
-                    .then(data => {
-                        const o = document.getElementById('output');
-                        o.innerHTML = `
-                            <div class="info-line"><span class="label">public_ip:</span> <span class="value">${data.public_ip}</span></div>
-                            <div class="info-line"><span class="label">peer_ip:</span> <span class="value">${data.peer_ip}</span></div>
-                            <div class="info-line"><span class="label">forwarded:</span> <span class="value">${data.forwarded}</span></div>
-                            <div class="info-line"><span class="label">user_agent:</span> <span class="value">${data.user_agent}</span></div>
-                            <div class="info-line"><span class="cursor">_</span></div>
-                        `;
-                        o.className = 'show';
-                    })
-                    .catch(err => {
-                        const o = document.getElementById('output');
-                        o.innerHTML = '<div class="info-line"><span class="value">error fetching data</span></div>';
-                        o.className = 'show';
-                    });
-            }
-        </script>
     </body>
 </html>
