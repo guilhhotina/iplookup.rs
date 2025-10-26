@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    io::Write,
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -83,7 +83,7 @@ fn main() {
     // this way we keep only the real connections
     for stream in listener.incoming().flatten() {
         // clones the arc reference for this task
-        // arc::clone only increments the reference count, doesn't copy the data
+        // arc::clone only increments the reference count, doesnt copy the data
         let limiter = Arc::clone(&limiter);
         // sends the work to the pool
         pool.execute(move || {
@@ -91,6 +91,55 @@ fn main() {
             handle_connection(stream, limiter);
         });
     }
+}
+
+// actually reads the full request from the stream
+// this is critical because peek doesnt consume data and can cause deadlocks
+fn read_request(stream: &mut TcpStream) -> Result<String, std::io::Error> {
+    let mut buf = [0; 8192]; // bigger buffer for safety
+    let mut request = Vec::new();
+    let mut content_length = 0;
+    let mut body_start = 0;
+
+    // read until we have complete headers
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+
+        let req_str = String::from_utf8_lossy(&request);
+
+        // look for end of headers
+        if let Some(pos) = req_str.find("\r\n\r\n") {
+            body_start = pos + 4;
+
+            // extract content-length if present
+            for line in req_str.lines() {
+                if line.to_lowercase().starts_with("content-length:") {
+                    if let Some(len_str) = line.split(':').nth(1) {
+                        content_length = len_str.trim().parse().unwrap_or(0);
+                    }
+                    break;
+                }
+            }
+
+            let body_received = request.len() - body_start;
+
+            // if we got all the body or theres no body, were done
+            if body_received >= content_length {
+                break;
+            }
+        }
+
+        // avoid infinite loop on malformed requests
+        if request.len() > 16384 {
+            break;
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&request).to_string())
 }
 
 fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
@@ -104,7 +153,7 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
     // this is the direct ip of the connection (usually from proxy)
     let peer_ip = match stream.peer_addr() {
         Ok(addr) => addr.ip().to_string(),
-        Err(_) => return, // if we can't get the ip, just drop the connection
+        Err(_) => return, // if we cant get the ip, just drop the connection
     };
 
     // checks if this ip has exceeded the rate limit
@@ -119,16 +168,12 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
         return;
     }
 
-    // creates a buffer to peek at the request
-    // peek lets us see what arrived without consuming it
-    let mut buf = [0; 4096];
-    if stream.peek(&mut buf[..]).is_err() {
-        return; // if we can't read, just give up
-    }
-
-    // converts the buffer bytes to string
-    // from_utf8_lossy ignores invalid chars instead of panicking
-    let req = String::from_utf8_lossy(&buf);
+    // actually reads the full request now instead of just peeking
+    // this is crucial to avoid the browser hanging on post requests
+    let req = match read_request(&mut stream) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
 
     // grabs the first request line safely
     // this avoids false positives from searching the whole buffer
@@ -253,7 +298,7 @@ fn send_response(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) 
     // writes the http response directly without building a big string
     let _ = write!(
         stream,
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
         ctype,
         body.len(),
