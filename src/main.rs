@@ -9,19 +9,21 @@ use std::{
 
 type RateLimiter = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 
+struct IpInfo {
+    public_ip: String,
+    peer_ip: String,
+    forwarded: String,
+    user_agent: String,
+}
+
 // simple fixed size thread pool
 struct ThreadPool {
-    // holds worker threads
-    workers: Vec<Worker>,
     // sender side of the job channel
     tx: mpsc::Sender<Job>,
 }
 
 // boxed closure to run as a job
 type Job = Box<dyn FnOnce() + Send + 'static>;
-
-// single worker holding its thread handle
-struct Worker(thread::JoinHandle<()>);
 
 impl ThreadPool {
     // creates a new pool with N threads
@@ -30,25 +32,21 @@ impl ThreadPool {
         let (tx, rx) = mpsc::channel::<Job>();
         // wrap receiver so many threads can block on it
         let rx = Arc::new(Mutex::new(rx));
-        // preallocate workers vector
-        let mut workers = Vec::with_capacity(size);
         // spawn N threads that pull jobs and run them
         for _ in 0..size {
-            // clone the shared receiver for this worker
+            // clone the shared receiver for this thread
             let rx = Arc::clone(&rx);
             // start the worker loop
-            let handle = thread::spawn(move || {
+            thread::spawn(move || {
                 // keep receiving jobs until sender is dropped
                 while let Ok(job) = rx.lock().unwrap().recv() {
                     // run the job
                     job();
                 }
             });
-            // store worker handle
-            workers.push(Worker(handle));
         }
         // return the pool
-        Self { workers, tx }
+        Self { tx }
     }
 
     // schedules a job to run on the pool
@@ -136,22 +134,28 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
     // this avoids false positives from searching the whole buffer
     let first_line = req.lines().next().unwrap_or("");
 
-    // decides what to respond based on the request path
-    // GET /ip returns json with ip info
-    // GET / returns the html page
-    // anything else gets a 404
-    let (status, body, ctype) = if first_line.starts_with("GET /ip ") {
-        // extracts detailed ip information from headers and connection
+    // route logic for javascript-free experience
+    let (status, body, ctype) = if first_line.starts_with("GET / ") {
+        // serves initial page, no ip data
+        let html_template = include_str!("index.html");
+        let final_html = html_template.replace("{ip_info_placeholder}", "");
+        ("200 OK", final_html, "text/html")
+    } else if first_line.starts_with("POST / ") {
+        // get data and updates page with ip
         let ip_info = extract_ip_info(&req, &peer_ip);
-        ("200 OK", ip_info, "application/json")
-    } else if first_line.starts_with("GET / ") {
-        // includes the html file at compile time
-        // means it doesn't need external files to run
-        (
-            "200 OK",
-            include_str!("index.html").to_string(),
-            "text/html",
-        )
+        let html_template = include_str!("index.html");
+        let ip_info_html = format!(
+            r#"
+            <div class="info-line"><span class="label">public_ip:</span> <span class="value">{}</span></div>
+            <div class="info-line"><span class="label">peer_ip:</span> <span class="value">{}</span></div>
+            <div class="info-line"><span class="label">forwarded:</span> <span class="value">{}</span></div>
+            <div class="info-line"><span class="label">user_agent:</span> <span class="value">{}</span></div>
+            <div class="info-line"><span class="cursor">_</span></div>
+            "#,
+            ip_info.public_ip, ip_info.peer_ip, ip_info.forwarded, ip_info.user_agent
+        );
+        let final_html = html_template.replace("{ip_info_placeholder}", &ip_info_html);
+        ("200 OK", final_html, "text/html")
     } else {
         ("404 Not Found", "not found".to_string(), "text/plain")
     };
@@ -160,7 +164,7 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
     send_response(&mut stream, status, ctype, &body);
 }
 
-fn extract_ip_info(req: &str, peer_ip: &str) -> String {
+fn extract_ip_info(req: &str, peer_ip: &str) -> IpInfo {
     // picks only the headers we care about while scanning
     let mut fly = None; // fly-client-ip value if present
     let mut xff = None; // x-forwarded-for full list if present
@@ -206,14 +210,12 @@ fn extract_ip_info(req: &str, peer_ip: &str) -> String {
     // takes user agent or unknown
     let user_agent = ua.unwrap_or_else(|| "unknown".to_string());
 
-    // formats a tiny json string escaping quotes in user agent
-    format!(
-        r#"{{"public_ip":"{}","peer_ip":"{}","forwarded":"{}","user_agent":"{}"}}"#,
+    IpInfo {
         public_ip,
-        peer_ip,
+        peer_ip: peer_ip.to_string(),
         forwarded,
-        user_agent.replace('"', "\\\"")
-    )
+        user_agent,
+    }
 }
 
 fn check_rate_limit(limiter: &RateLimiter, ip: &str) -> bool {
