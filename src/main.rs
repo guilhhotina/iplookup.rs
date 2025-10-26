@@ -2,11 +2,64 @@ use std::{
     collections::HashMap,
     io::Write,
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
 type RateLimiter = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
+
+// simple fixed size thread pool
+struct ThreadPool {
+    // holds worker threads
+    workers: Vec<Worker>,
+    // sender side of the job channel
+    tx: mpsc::Sender<Job>,
+}
+
+// boxed closure to run as a job
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+// single worker holding its thread handle
+struct Worker(thread::JoinHandle<()>);
+
+impl ThreadPool {
+    // creates a new pool with N threads
+    fn new(size: usize) -> Self {
+        // creates channel for jobs
+        let (tx, rx) = mpsc::channel::<Job>();
+        // wrap receiver so many threads can block on it
+        let rx = Arc::new(Mutex::new(rx));
+        // preallocate workers vector
+        let mut workers = Vec::with_capacity(size);
+        // spawn N threads that pull jobs and run them
+        for _ in 0..size {
+            // clone the shared receiver for this worker
+            let rx = Arc::clone(&rx);
+            // start the worker loop
+            let handle = thread::spawn(move || {
+                // keep receiving jobs until sender is dropped
+                while let Ok(job) = rx.lock().unwrap().recv() {
+                    // run the job
+                    job();
+                }
+            });
+            // store worker handle
+            workers.push(Worker(handle));
+        }
+        // return the pool
+        Self { workers, tx }
+    }
+
+    // schedules a job to run on the pool
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // send the job ignoring errors if pool is shutting down
+        let _ = self.tx.send(Box::new(f));
+    }
+}
 
 fn main() {
     // starts the tcp server on port 8080
@@ -19,14 +72,26 @@ fn main() {
     // mutex ensures only one thread can modify it at a time
     let limiter: RateLimiter = Arc::new(Mutex::new(HashMap::new()));
 
+    // creates a small thread pool sized to cpu * 4
+    // unwrap_or uses 8 if detection fails
+    let pool = ThreadPool::new(
+        thread::available_parallelism()
+            .map(|n| n.get() * 4)
+            .unwrap_or(8),
+    );
+
     // incoming waits for someone to connect
     // flatten removes the Option and Result that come along
     // this way we keep only the real connections
     for stream in listener.incoming().flatten() {
-        // clones the arc reference for this thread
+        // clones the arc reference for this task
         // arc::clone only increments the reference count, doesn't copy the data
         let limiter = Arc::clone(&limiter);
-        handle_connection(stream, limiter);
+        // sends the work to the pool
+        pool.execute(move || {
+            // handles the connection inside a worker thread
+            handle_connection(stream, limiter);
+        });
     }
 }
 
@@ -67,15 +132,19 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
     // from_utf8_lossy ignores invalid chars instead of panicking
     let req = String::from_utf8_lossy(&buf);
 
+    // grabs the first request line safely
+    // this avoids false positives from searching the whole buffer
+    let first_line = req.lines().next().unwrap_or("");
+
     // decides what to respond based on the request path
     // GET /ip returns json with ip info
     // GET / returns the html page
     // anything else gets a 404
-    let (status, body, ctype) = if req.contains("GET /ip") {
+    let (status, body, ctype) = if first_line.starts_with("GET /ip ") {
         // extracts detailed ip information from headers and connection
         let ip_info = extract_ip_info(&req, &peer_ip);
         ("200 OK", ip_info, "application/json")
-    } else if req.starts_with("GET / ") {
+    } else if first_line.starts_with("GET / ") {
         // includes the html file at compile time
         // means it doesn't need external files to run
         (
@@ -92,47 +161,52 @@ fn handle_connection(mut stream: TcpStream, limiter: RateLimiter) {
 }
 
 fn extract_ip_info(req: &str, peer_ip: &str) -> String {
-    // creates a hashmap to store http headers
-    let mut headers = HashMap::new();
+    // picks only the headers we care about while scanning
+    let mut fly = None; // fly-client-ip value if present
+    let mut xff = None; // x-forwarded-for full list if present
+    let mut xreal = None; // x-real-ip value if present
+    let mut ua = None; // user-agent value if present
 
-    // skips the first line (request line) and processes the rest
-    // stops at the empty line that separates headers from body
+    // skips the request line and reads headers until the empty line
     for line in req.lines().skip(1) {
+        // blank line ends headers
         if line.is_empty() {
             break;
         }
-        // splits each header line at the first colon
-        // stores headers in lowercase for case-insensitive matching
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+        // splits at the first colon
+        if let Some((k, v)) = line.split_once(':') {
+            // trim spaces around key and value
+            let key = k.trim();
+            let val = v.trim();
+            // match header names case-insensitively
+            if key.eq_ignore_ascii_case("fly-client-ip") {
+                fly = Some(val.to_string());
+            } else if key.eq_ignore_ascii_case("x-forwarded-for") {
+                xff = Some(val.to_string());
+            } else if key.eq_ignore_ascii_case("x-real-ip") {
+                xreal = Some(val.to_string());
+            } else if key.eq_ignore_ascii_case("user-agent") {
+                ua = Some(val.to_string());
+            }
         }
     }
 
-    // tries to find the real public ip from various headers
-    // checks them in order of preference
-    let public_ip = headers
-        .get("fly-client-ip")
-        .or_else(|| headers.get("x-forwarded-for"))
-        .or_else(|| headers.get("x-real-ip"))
-        // x-forwarded-for can contain multiple ips, takes the first one
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        // if no headers found, falls back to the direct peer ip
+    // chooses public ip preferring fly then first from x-forwarded-for then x-real-ip then peer
+    let public_ip = fly
+        .or_else(|| {
+            xff.as_ref()
+                .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+        })
+        .or_else(|| xreal.clone())
         .unwrap_or_else(|| peer_ip.to_string());
 
-    // gets the user agent header or defaults to "unknown"
-    let user_agent = headers
-        .get("user-agent")
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
+    // takes the full forwarded chain or none
+    let forwarded = xff.unwrap_or_else(|| "none".to_string());
 
-    // gets the full forwarded header or defaults to "none"
-    let forwarded = headers
-        .get("x-forwarded-for")
-        .cloned()
-        .unwrap_or_else(|| "none".to_string());
+    // takes user agent or unknown
+    let user_agent = ua.unwrap_or_else(|| "unknown".to_string());
 
-    // formats everything as a json string
-    // escapes quotes in user agent to prevent breaking the json
+    // formats a tiny json string escaping quotes in user agent
     format!(
         r#"{{"public_ip":"{}","peer_ip":"{}","forwarded":"{}","user_agent":"{}"}}"#,
         public_ip,
@@ -144,18 +218,21 @@ fn extract_ip_info(req: &str, peer_ip: &str) -> String {
 
 fn check_rate_limit(limiter: &RateLimiter, ip: &str) -> bool {
     // tries to lock the mutex
-    // if poisoned (another thread panicked), just allow the request
+    // if poisoned just allow the request
     let mut map = match limiter.lock() {
         Ok(m) => m,
         Err(_) => return true,
     };
 
+    // captures current time
     let now = Instant::now();
-    let window = Duration::from_secs(60); // 1 minute window
-    let max_requests = 30; // max 30 requests per minute per ip
+    // 1 minute window
+    let window = Duration::from_secs(60);
+    // max 30 requests per minute per ip
+    let max_requests = 30;
 
     // gets or creates the timestamp vector for this ip
-    let timestamps = map.entry(ip.to_string()).or_insert_with(Vec::new);
+    let timestamps = map.entry(ip.to_owned()).or_default();
 
     // removes old timestamps outside the window
     timestamps.retain(|&t| now.duration_since(t) < window);
@@ -171,19 +248,15 @@ fn check_rate_limit(limiter: &RateLimiter, ip: &str) -> bool {
 }
 
 fn send_response(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
-    // builds the http response string
-    // includes status line, content type, content length, and body
-    let response = format!(
+    // writes the http response directly without building a big string
+    let _ = write!(
+        stream,
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
         status,
         ctype,
         body.len(),
         body
     );
-
-    // writes the response to the stream
-    // ok() ignores any write errors, not much we can do anyway
-    stream.write_all(response.as_bytes()).ok();
     // flush ensures all data is sent immediately
-    stream.flush().ok();
+    let _ = stream.flush();
 }
